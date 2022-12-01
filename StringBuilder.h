@@ -2,25 +2,33 @@
 #include "Output.h"
 #include "Global.h"
 
-#define Sbb StringBuilder::ins()
 
-#define STRING_BUILDER_DEF_SIZE 1000
+#define Sb StringBuilder::ins()
 
-
-class StringBuilder;
-#if !defined(NO_GLOBAL_INSTANCES)
-    extern StringBuilder Sb;
+#if !defined STRING_BUILDER_BUF_SIZE || STRING_BUILDER_BUF_SIZE < 32
+    #define STRING_BUILDER_BUF_SIZE 1024
 #endif
+
+//#define DEBUG
 
 class StringBuilder : public Buffer, CString { //=============================================  Class
 
 
 private: //██████████████████████████████████████████████████████████████████████████████████████████  PRIVATE
-char buf[STRING_BUILDER_DEF_SIZE] = "";   // primary buffer
+inline static std::shared_ptr<StringBuilder> _ins;    // smart pointer for singleton instance
+inline static size_t _defCap = STRING_BUILDER_BUF_SIZE;
+inline static const char _null[1] = "";
+
+size_t _cap;
+
+//char buf[_CAPACITY] = "";   // primary buffer
+char* buf;         // primary buffer
+size_t sPtr = 0;                          // pointer to start of last string in [buf]
+
 boolean _start = false;
 boolean _end = true;            // set to true to end the string
-size_t sPtr = 0;                // pointer to start of free space in buf
 boolean _retain = false;        // true to keep old strings in buf cause they're still in use
+boolean circularRetain = false; // true to start from buf[0] once [buf] is full
 
 // macro
 #define _LockCheck()\
@@ -35,22 +43,28 @@ struct BufInfo //==============================================  BufInfo f
 FORCE_INLINE boolean isLock() { return _start; } //=============  isLock f
 
 
-size_t getBufLen() { return strlen(buf); } //================  getBufLen f
-size_t getCBufLen() { return strlen(getCBuf()); } //========  getCBufLen f
+FORCE_INLINE size_t getBufLen() { return _cap; } //==========  getBufLen f
 
-BufInfo getBufInfo() //=====================================  getBufInfo f
-{   char* cBuf = getCBuf();
-    int cBufLen = strlen(cBuf);
+/** get info for catting new string
+ *  @return ptr cat pos, and available size of buffer to use */
+void getBufInfo() //========================================  getBufInfo f
+{   char* cBuf = getCBuf();       // current buf
+    int cBufLen = strlen(cBuf);   // current buf len
 
-    
-    info.start = cBuf + cBufLen;
-    info.free = sizeof(buf) - sPtr - cBufLen - 1; // '\0' Maybe wrong
-//    Serial.printf("cBufLen = %d, info.start = %d, free = %d\n", cBufLen, info.start, info.free);
-    return info;
+    info.start = cBuf + cBufLen;                    // start after current buf ends
+    info.free = _cap /**sizeof(buf)*/ - sPtr - cBufLen - 1;   // available space of buf, -1 for '\0'
+    //   ↓buf start             ↓'\0'              ↓buf end
+    //  |aaa bbb ccccccccccccccc                   |
+    //           ^sPrt         ^cBufLen
 }
 
+/** get buffer at current [sPtr] */
 char* getCBuf() //=============================================  getCBuf f
-{   return buf + sPtr;
+{   
+    #ifdef DEBUG
+        Serial.printf("___buf[%d] = [%s], strlen = %d, retain = %d, free = %d\n", sPtr, buf + sPtr, strlen(buf + sPtr), _retain, info.free);
+    #endif
+    return buf + sPtr;
 }
 
 /** get buffer at cat pos */
@@ -59,73 +73,129 @@ char* getCat() //===============================================  getCat f
     return info.start;
 }
 
-
-public: //██████████████████████████████████████████████████████████████████████████████████████████  PUBLIC 
-FORCE_INLINE static StringBuilder &ins() { return Sb; } //========  &ins f
-
-const char* c_str() override //==================================  c_str f
-{   return buf;
+FORCE_INLINE void setSPtr(int pos, boolean erase = false) //===  setSPtr f
+{   sPtr = pos;
+    if (erase)
+        buf[sPtr] = '\0';
 }
 
-inline char* get() { return buf; } //==============================  get f
+void setSPtrOffset(int offset) //========================  setSPtrOffset f
+{   int newPtr = sPtr + offset;
+    if (0 <= newPtr && newPtr < getBufLen())
+        sPtr = newPtr;
+}
 
-char* getBuffer() override { return buf; }
+
+FORCE_INLINE void setup(StringBuilder* i) { if (!_ins) _ins.reset(i); }
+
+public: //██████████████████████████████████████████████████████████████████████████████████████████  PUBLIC
+~StringBuilder() { delete [] buf; }
+StringBuilder()           : buf(new char[_defCap]), _cap(_defCap) { setup(this); }
+StringBuilder(size_t cap) : buf(new char[cap])    , _cap(cap)     { setup(this); }
+
+FORCE_INLINE static StringBuilder &ins() //=======================  &ins f
+{   if (!_ins)
+        new StringBuilder();
+    return *_ins;
+        
+}
+
+inline static void setBufferSize(size_t size) //=========  setBufferSize f
+{   _defCap = size;
+}
+
+FORCE_INLINE const char* c_str() override { return buf; } //=====  c_str f
+
+FORCE_INLINE char* getBuffer() override { return buf; } //===  getBuffer f
 
 StringBuilder &start() //=======================================  &start f
 {   _LockCheck();
 
-    if (!_retain)
-        buf[0] = '\0';  // reset buf
+    buf[sPtr] = '\0';  // reset buf
 
     _start = true;
-    _end = false;   // remove termination
+    _end = false;
     return *this;
 }
 
-StringBuilder &start(const char* s)
-{   start();
-    return cat(s);
-}
-
-char* startBuf() //===========================================  startBuf f
-{   start();
-    return getCBuf();
-}
+StringBuilder &start(const char* s) { return start().cat(s); }
 
 
-char* end() //=====================================================  end f
-{   _start = false;
+/** be extremely careful with manually writing [buf] */
+char* startBuf() { return start().getCBuf(); } //=============  startBuf f
+
+
+const char* end() //===============================================  end f
+{   _ReturnIfn(_start, getCBuf());
+
+    _start = false;
     _end = true;
-    char* string = getCBuf();
-    if (_retain)                       // if retain
-    {   sPtr += (strlen(string) + 1); // move pointer to next free location, +1 for '\0'
-//        Serial.printf("sPtr = %d, strlen(string) = %d, string = %s\n", sPtr, strlen(string), string);
+    char* currentStr = getCBuf();
+    
+    if (_retain)                          // if retain
+    {   size_t sLen = strlen(currentStr);
+        setSPtrOffset(sLen + 1);
+        #ifdef DEBUG
+            Serial.printf("AAAAAAA sPtr = %d, strlen(string) = %d, string = %s\n", sPtr, strlen(currentStr), currentStr);
+        #endif
     }
     else
-        sPtr = 0;
-    return string;
+        setSPtr(0);
+    return currentStr;
 }
 
 /** raw cat, no check, not safe, use with caution */
 void catRaw(const char* s) { strcat(buf, s); } //===============  catRaw f
 
 /** concat string, memory safe */
-StringBuilder &cat(const char* s) //================================  cat f
-{   getBufInfo();
-    int inputLen = strlen(s);
-    
-    if (inputLen <= info.free)
-        strcat(info.start, s);
+StringBuilder &cat(const char* s, size_t len) //===================  cat f
+{   _ReturnIfn(_start, *this);
+
+    getBufInfo();
+
+    if (len <= info.free)
+        strncat(info.start, s, len);
     else
         end();
 
     return *this;
 }
 
-typedef std::function<void(char*)> Catter;
+StringBuilder &cat(const char* s) { return cat(s, strlen(s)); }
 
+StringBuilder &catIf(boolean _if, const char* s)
+{   if (_if)
+        cat(s);
+    return *this;
+}
+
+/** cat a char */
+StringBuilder &cat(const char c)
+{   _ReturnIfn(_start, *this);
+
+    getBufInfo();
+    
+    if (info.free >= 1)
+    {   info.start[0] = c;
+        info.start[1] = '\0';
+    }
+    else
+        end();
+
+    return *this;
+}
+
+StringBuilder &catIf(boolean _if, const char c)
+{   if (_if)
+        cat(c);
+    return *this;
+}
+
+typedef std::function<void(char*)> Catter;
 StringBuilder &cat(const Catter &catter)
-{   catter(getCat());
+{   _ReturnIfn(_start, *this);
+
+    catter(getCat());
     return *this;
 }
 
@@ -135,42 +205,48 @@ StringBuilder &catln(const Catter &catter)
     return catln();
 }
 
-StringBuilder &catlnIf(boolean b) { if (b) catln(); return *this; } //  &catlnIf f
+StringBuilder &catlnIf(boolean b) { if (b) catln(); return *this; } //  catlnIf f
 
-
+    
 /** concat formated string, memory safe */
-StringBuilder &catf(const char* format, ...) //====================  catf f
-{   getBufInfo();
+StringBuilder &catf(const char* format, ...) //===================  catf f
+{   _ReturnIfn(_start, *this);
 
-    va_list vl;
-    va_start(vl, format);
-    vsnprintf(info.start, info.free, format, vl);
-    va_end(vl);
+    getBufInfo();
 
-    return *this;
-}
+    _VaList(format
+        , int inputSize = vsnprintf(info.start, info.free, format, vl));
 
-/** concat formated params, memory safe
- *  [len]: how many params to process
-*/
-StringBuilder &catfp(Parameter &p, const int LEN, const char* format, ...) //  catfp f
-{   va_list vl;
-    va_start(vl, format);
-
-    for (int paramNum, i = 0; i < LEN; i++)
-    {   paramNum = va_arg(vl, int);
-        getBufInfo();
-        snprintf(info.start, info.free, format, p.param(paramNum));
+    if (inputSize > info.free)
+    {   info.start[0] = '\0';
+        end();
+        #ifdef DEBUG
+            Serial.print("+++++++++++++++++++++++++++++++++++++++++ inputSize > info.free, overflow, end()\n");
+        #endif
     }
 
-    va_end(vl);
+    return *this;
+}
+    
+/** concat formated params, memory safe
+ *  [len]: how many params to process */
+StringBuilder &catfp(Parameter<auto> &p, const int LEN, const char* format, ...) //  catfp f
+{   _ReturnIfn(_start, *this);
+
+    _VaList(format,
+        for (int paramNum, i = 0; i < LEN; i++)
+        {   paramNum = va_arg(vl, int);
+            getBufInfo();
+            snprintf(info.start, info.free, format, p.param(paramNum));
+        });
+    
     return *this;
 }
 
 
 
-StringBuilder &print() //=========================================  print f
-{   Out.print(c_str());
+StringBuilder &print() //===============================  print f
+{   Serial.print(c_str());
     return *this;
 }
 
@@ -190,23 +266,24 @@ StringBuilder &printlnEnd() //==============================  printlnEnd f
     return *this;
 }
 
-/** keep old strings in buf cause they're still in use */
-using Retain = std::function<void(StringBuilder &Sb)>;
-StringBuilder &retain(Retain retain) //========================  &retain f
-{   _retain = true;
-    retain(*this);
-    _retain = false;
+/** keep old strings in [buf] cause they're still in use */
+using Retain = std::function<void()>;
+StringBuilder &retain(Retain r) //==============================  retain f
+{   retain(true);
+    r();
+    retain(false);
     return *this;
 }
 
-StringBuilder &retain(boolean b = true)
+inline StringBuilder &retain(boolean b = true)
 {   _retain = b;
-    if (!_retain)
-        sPtr = 0;
+    setSPtr(0);
     return *this;
 }
 
 size_t free() { getBufInfo(); return info.free; } //==============  free f
+
+const char* null() { return _null; } //===========================  null f
 
 
 }; //=====================================================================
